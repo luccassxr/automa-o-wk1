@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import re
 from collections import Counter
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
@@ -26,12 +27,180 @@ from robo_cartoes_emsys_v3 import (
     copy_current_row_text,
     extract_rs_original_from_row,
     extract_titulo_from_row,
-    valecard_capture_from_pdf,
-    valecard_somar_despesas_pdf,
+    valecard_capture_from_pdf as _legacy_valecard_capture_from_pdf,
+    valecard_somar_despesas_pdf as _legacy_valecard_somar_despesas_pdf,
     redefrota_capture_from_pdf,
 )
 
 import storage
+
+
+_RE_DT_OR_DATE = re.compile(r"\b\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?\b")
+_RE_BRL = re.compile(r"[-+]?\s*\d{1,3}(?:\.\d{3})*,\d{2}")
+
+
+def _normalize_dt_flexible(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+
+    dt = normalize_dt(value)
+    if dt:
+        return dt
+
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            return parsed.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            continue
+
+    return ""
+
+
+def _extract_text_from_all_pages(pdf_path: str) -> str:
+    import pdfplumber
+
+    chunks: List[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            if txt.strip():
+                chunks.append(txt)
+    return "\n".join(chunks)
+
+
+def _extract_valecard_rows_from_text(text: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    seen = set()
+
+    for raw_line in text.splitlines():
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+
+        dt_match = _RE_DT_OR_DATE.search(line)
+        if not dt_match:
+            continue
+
+        values = _RE_BRL.findall(line)
+        if not values:
+            continue
+
+        dt = _normalize_dt_flexible(dt_match.group(0))
+        bruto = normalize_brl(values[-1])
+        if not dt or not bruto:
+            continue
+
+        try:
+            if brl_to_float(bruto) <= 0:
+                continue
+        except Exception:
+            continue
+
+        id_match = re.search(r"(?:NSU|AUT(?:ORIZA[ÇC][AÃ]O)?|C[ÓO]D(?:IGO)?)\D*(\d{4,})", line, re.IGNORECASE)
+        item_id = id_match.group(1) if id_match else ""
+
+        key = (dt, bruto, item_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"dt": dt, "bruto": bruto, "id": item_id})
+
+    return rows
+
+
+def _dedupe_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for r in rows:
+        dt = _normalize_dt_flexible(r.get("dt", ""))
+        bruto = normalize_brl(r.get("bruto", ""))
+        item_id = (r.get("id", "") or "").strip()
+        if not dt or not bruto:
+            continue
+        key = (dt, bruto, item_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"dt": dt, "bruto": bruto, "id": item_id})
+    return out
+
+
+def valecard_capture_from_pdf(pdf_path: str) -> List[Dict[str, str]]:
+    """
+    Captura vendas do Vale Card em todas as páginas do PDF.
+    Sempre combina parser legado + parser multipágina local para não perder linhas.
+    """
+    legacy_rows: List[Dict[str, str]] = []
+    try:
+        legacy_rows = _legacy_valecard_capture_from_pdf(pdf_path) or []
+    except Exception:
+        legacy_rows = []
+
+    text = _extract_text_from_all_pages(pdf_path)
+    fallback_rows = _extract_valecard_rows_from_text(text)
+
+    combined = _dedupe_rows([*legacy_rows, *fallback_rows])
+    if not combined:
+        return []
+
+    def sort_key(item: Dict[str, str]):
+        try:
+            return datetime.strptime(item["dt"], "%d/%m/%Y %H:%M:%S")
+        except Exception:
+            return datetime.max
+
+    combined.sort(key=sort_key)
+    return combined
+
+
+def valecard_somar_despesas_pdf(pdf_path: str) -> Dict[str, float]:
+    """
+    Soma despesas do Vale Card em todas as páginas do PDF.
+    Mantém compatibilidade com as chaves retornadas pela função legada.
+    """
+    try:
+        legacy = _legacy_valecard_somar_despesas_pdf(pdf_path)
+        if legacy:
+            return legacy
+    except Exception:
+        pass
+
+    text = _extract_text_from_all_pages(pdf_path)
+
+    total_taxa_adm = 0.0
+    total_outras = 0.0
+
+    for raw_line in text.splitlines():
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        values = _RE_BRL.findall(line)
+        if not values:
+            continue
+
+        norm_line = line.lower()
+        value = 0.0
+        for v in values:
+            try:
+                value += brl_to_float(normalize_brl(v))
+            except Exception:
+                continue
+
+        if not value:
+            continue
+
+        if "taxa" in norm_line and "admin" in norm_line:
+            total_taxa_adm += value
+        elif any(k in norm_line for k in ("despesa", "tarifa", "encargo", "custo", "mensalidade")):
+            total_outras += value
+
+    return {
+        "total_despesas": total_taxa_adm + total_outras,
+        "total_taxa_adm": total_taxa_adm,
+        "total_outras": total_outras,
+    }
 
 
 def get_base_dir() -> str:
