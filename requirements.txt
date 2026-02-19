@@ -1,0 +1,7 @@
+pyautogui
+pyperclip
+pdfplumber
+playwright
+ttkbootstrap
+pillow
+
