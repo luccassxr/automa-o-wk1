@@ -72,7 +72,6 @@ def _extract_text_from_all_pages(pdf_path: str) -> str:
 
 def _extract_valecard_rows_from_text(text: str) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
-    seen = set()
 
     for raw_line in text.splitlines():
         line = (raw_line or "").strip()
@@ -98,39 +97,80 @@ def _extract_valecard_rows_from_text(text: str) -> List[Dict[str, str]]:
         except Exception:
             continue
 
-        id_match = re.search(r"(?:NSU|AUT(?:ORIZA[ÇC][AÃ]O)?|C[ÓO]D(?:IGO)?)\D*(\d{4,})", line, re.IGNORECASE)
+        id_match = re.search(r"\b(\d{4,})\b", line)
         item_id = id_match.group(1) if id_match else ""
-
-        key = (dt, bruto, item_id)
-        if key in seen:
-            continue
-        seen.add(key)
         rows.append({"dt": dt, "bruto": bruto, "id": item_id})
 
     return rows
 
 
-def _dedupe_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def _extract_valecard_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
+    import pdfplumber
+
     out: List[Dict[str, str]] = []
-    seen = set()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+            for table in tables:
+                for row in table or []:
+                    cells = [((c or "").strip()) for c in row if c is not None]
+                    if not cells:
+                        continue
+                    joined = " ".join(cells)
+                    dt_match = _RE_DT_OR_DATE.search(joined)
+                    vals = _RE_BRL.findall(joined)
+                    if not dt_match or not vals:
+                        continue
+                    dt = _normalize_dt_flexible(dt_match.group(0))
+                    bruto = normalize_brl(vals[-1])
+                    if not dt or not bruto:
+                        continue
+                    try:
+                        if brl_to_float(bruto) <= 0:
+                            continue
+                    except Exception:
+                        continue
+                    item_id = ""
+                    for c in cells:
+                        m = re.fullmatch(r"\d{4,}", c.replace(" ", ""))
+                        if m:
+                            item_id = m.group(0)
+                            break
+                    out.append({"dt": dt, "bruto": bruto, "id": item_id})
+    return out
+
+
+def _normalize_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     for r in rows:
         dt = _normalize_dt_flexible(r.get("dt", ""))
         bruto = normalize_brl(r.get("bruto", ""))
         item_id = (r.get("id", "") or "").strip()
         if not dt or not bruto:
             continue
-        key = (dt, bruto, item_id)
-        if key in seen:
-            continue
-        seen.add(key)
         out.append({"dt": dt, "bruto": bruto, "id": item_id})
+    return out
+
+
+def _rows_counter(rows: List[Dict[str, str]]) -> Counter:
+    return Counter((r["dt"], r["bruto"], r.get("id", "")) for r in rows)
+
+
+def _expand_counter_rows(counter: Counter) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for (dt, bruto, item_id), count in counter.items():
+        for _ in range(count):
+            out.append({"dt": dt, "bruto": bruto, "id": item_id})
     return out
 
 
 def valecard_capture_from_pdf(pdf_path: str) -> List[Dict[str, str]]:
     """
     Captura vendas do Vale Card em todas as páginas do PDF.
-    Sempre combina parser legado + parser multipágina local para não perder linhas.
+    Combina parser legado + extração multipágina (texto+tabelas) preservando repetições reais.
     """
     legacy_rows: List[Dict[str, str]] = []
     try:
@@ -139,11 +179,22 @@ def valecard_capture_from_pdf(pdf_path: str) -> List[Dict[str, str]]:
         legacy_rows = []
 
     text = _extract_text_from_all_pages(pdf_path)
-    fallback_rows = _extract_valecard_rows_from_text(text)
+    rows_text = _extract_valecard_rows_from_text(text)
+    rows_table = _extract_valecard_rows_from_tables(pdf_path)
 
-    combined = _dedupe_rows([*legacy_rows, *fallback_rows])
-    if not combined:
-        return []
+    legacy_norm = _normalize_rows(legacy_rows)
+    local_norm = _normalize_rows([*rows_text, *rows_table])
+
+    c_legacy = _rows_counter(legacy_norm)
+    c_local = _rows_counter(local_norm)
+
+    merged = Counter()
+    for k in set(c_legacy) | set(c_local):
+        # usa a maior contagem entre os dois parsers para evitar
+        # duplicar quando ambos encontrarem o mesmo registro
+        merged[k] = max(c_legacy.get(k, 0), c_local.get(k, 0))
+
+    combined = _expand_counter_rows(merged)
 
     def sort_key(item: Dict[str, str]):
         try:
